@@ -1,0 +1,140 @@
+#!/usr/bin/python3
+"""Linux command and user-service lifecycle for Codex's Hysteria 2 route."""
+import fcntl
+import http.client
+import json
+import os
+from pathlib import Path
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+import clash_route as route
+
+
+def unit(*args, check=True, capture=False):
+    return subprocess.run(["systemctl", "--user", *args, "codex-ny.service"], check=check,
+                          capture_output=capture, text=True)
+
+
+def notify(message):
+    address = os.environ.get("NOTIFY_SOCKET")
+    if address:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.sendto(message.encode(), address.replace("@", "\x00", 1) if address.startswith("@") else address)
+
+
+def run_service():
+    stopping = threading.Event()
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, lambda *_: stopping.set())
+    try:
+        # A login-enabled unit can start before the user's Clash GUI has opened its controller.
+        for attempt in range(16):
+            try:
+                route.api("GET", "/version", timeout=2)
+                break
+            except OSError:
+                if stopping.wait(2):
+                    return
+                if attempt == 15:
+                    raise
+        route.restore()
+        if stopping.is_set():
+            return
+        journal = route.install()
+        expected_ip = journal["expected_ip"]
+        notify("READY=1\nSTATUS=Codex Hysteria 2 · " + expected_ip)
+        next_probe = time.monotonic() + 60
+        misses = 0
+        while not stopping.wait(10):
+            if not route.healthy(journal):
+                raise RuntimeError("Clash 运行配置已变化，重新应用前将恢复原设置。")
+            if time.monotonic() >= next_probe:
+                ip = route.exit_ip()
+                misses = 0 if ip == expected_ip else misses + 1
+                if (ip and ip != expected_ip) or misses >= 3:
+                    raise RuntimeError("纽约公网出口验证失败。")
+                next_probe = time.monotonic() + (10 if misses else 60)
+    finally:
+        route.restore()
+
+
+def start():
+    active = unit("is-active", "--quiet", check=False).returncode == 0
+    try:
+        if active and not route.current_node_matches():
+            unit("restart")
+        else:
+            unit("start")
+        unit("enable")
+    except subprocess.CalledProcessError:
+        if not active:
+            unit("stop", check=False)
+        raise
+    expected_ip = json.loads(route.JOURNAL.read_text())["expected_ip"]
+    print(f"Codex Hysteria 2 已启用，出口 {expected_ip}。")
+
+
+def stop():
+    unit("stop")
+    route.restore()
+    unit("disable")
+    print("已恢复原有 Clash 线路。")
+
+
+def main():
+    os.umask(0o077)
+    route.CFG.mkdir(parents=True, exist_ok=True, mode=0o700)
+    verb = sys.argv[1:] or ["status"]
+    if verb in (["_serve"], ["_recover"]):
+        with (route.CFG / "service.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if verb == ["_serve"]:
+                run_service()
+            else:
+                route.restore()
+        return
+    with (route.CFG / "switch.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if verb == ["start"]:
+            start()
+        elif verb == ["stop"]:
+            stop()
+        elif verb == ["status"]:
+            service = unit("is-active", check=False, capture=True).stdout.strip()
+            boot = unit("is-enabled", check=False, capture=True).stdout.strip()
+            print("Hysteria 2 服务", service, "登录自启", boot)
+            cfg = route.api("GET", "/configs")
+            print("Clash 模式", cfg["mode"], "TUN", cfg["tun"]["enable"])
+            if route.JOURNAL.exists() and route.healthy(json.loads(route.JOURNAL.read_text())):
+                print("Codex 纽约分流已启用，实测出口", route.exit_ip() or "暂不可达")
+            else:
+                print("Codex 纽约分流未启用。")
+        elif verb == ["test"]:
+            from verify import verify
+            return verify()
+        elif verb == ["uninstall"]:
+            stop()
+            lib = Path(__file__).resolve().parent
+            for name, target in (("codex", route.ENGINE), ("codex-ny", str(lib / "codex-ny"))):
+                link = Path.home() / ".local/bin" / name
+                if link.is_symlink() and os.readlink(link) == target:
+                    link.unlink()
+            (Path.home() / ".config/systemd/user/codex-ny.service").unlink(missing_ok=True)
+            subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+            for name in ("codex-ny", "clash_route.py", "verify.py"):
+                (lib / name).unlink(missing_ok=True)
+            print("工具已卸载。节点凭据和已有 Codex 项目仍保存在本机。")
+        else:
+            raise RuntimeError("用法: codex-ny {start|stop|status|test|uninstall}")
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError, http.client.HTTPException) as exc:
+        sys.exit(str(exc))

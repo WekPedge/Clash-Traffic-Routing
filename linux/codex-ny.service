@@ -1,0 +1,18 @@
+[Unit]
+Description=Codex New York Hysteria 2 egress
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+ExecStart=%h/.local/lib/codex-ny/codex-ny _serve
+ExecStopPost=%h/.local/lib/codex-ny/codex-ny _recover
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=160
+TimeoutStopSec=120
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target

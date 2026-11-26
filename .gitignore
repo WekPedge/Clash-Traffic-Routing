@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+/macos/build/
+*.app/
+client-profile.yaml
+ny-hy2-profile.yaml
+server.yaml
+*.key
+*.pem
+.env
+*.jsonl
+clash-restore.json
+status.json
